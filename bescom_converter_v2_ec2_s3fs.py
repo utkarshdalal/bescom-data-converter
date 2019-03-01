@@ -9,6 +9,7 @@ import itertools
 import multiprocessing
 import logging
 import sys
+import s3fs
 
 script_dir = os.path.dirname(__file__)
 
@@ -16,6 +17,11 @@ extraction_path = '/home/ec2-user/temp_extraction_folder/'
 csv_creation_path = '/home/ec2-user/csv_path/'
 rar_copy_path = '/home/ec2-user/temp_rar_path/'
 log_path = os.path.join(script_dir, 'bescom_converter.log')
+
+in_feeder_whitelisted_columns = ['ACTIVEPOWER', 'REACTIVEPOWER', 'ACTIVEENERGYEXP', 'ACTIVEENERGYIMP']
+transformer_line_whitelisted_columns = ['ACTIVEPOWER', 'REACTIVEPOWER', 'ACTIVEENERGYEXP', 'ACTIVEENERGYIMP']
+out_feeder_whitelisted_columns = ['ACTIVEPOWER', 'REACTIVEPOWER', 'ACTIVEENERGYEXP',
+                                  'ACTIVEENERGYIMP', 'IB', 'IR', 'IY']
 
 logging.basicConfig(filename=log_path, level=logging.INFO)
 
@@ -55,7 +61,7 @@ def write_csvs_for_file(root_and_file_tuple):
                 logging.exception(f'Could not write block 3 files for file {file}: ' + str(e))
                 logging.error(f'FAILED FILE {file}')
     except Exception as e:
-        logging.exception(f'Error while writing csv for {str(root_and_file_tuple)}: {str(e)}')
+        logging.exception(f'FAILED FILE Error while writing csv for {str(root_and_file_tuple)}: {str(e)}')
 
 
 def write_csvs_for_block_1(excel_file, substation_name, date, voltage):
@@ -100,7 +106,7 @@ def write_in_feeders_csvs(in_feeders_df, substation_name, date, timestamp_column
     feeder_voltage_dict = {}
 
     for column in in_feeders_df:
-        column_regex = re.search('.*?(\d+)(.*?)((RE)?ACTIVE.*)', column.strip())
+        column_regex = re.search('.*?(\d+)(.*?)((RE)?ACTIVE.*)', column.strip().replace(' ', ''))
         if column_regex is None:
             continue
         voltage = column_regex.group(1)
@@ -112,9 +118,11 @@ def write_in_feeders_csvs(in_feeders_df, substation_name, date, timestamp_column
         feeder_dict[feeder_name][column_type] = in_feeders_df[column].values
         feeder_voltage_dict[feeder_name] = voltage
 
+    feeder_dict = handle_feeders_w_re_ending(feeder_dict)
+
     for feeder_name in feeder_dict:
-        feeder_voltage = feeder_voltage_dict[feeder_name]
-        feeder_df = pd.DataFrame.from_dict(feeder_dict[feeder_name])
+        feeder_voltage = feeder_voltage_dict.get(feeder_name, feeder_voltage_dict.get(feeder_name[:-2], 'NA'))
+        feeder_df = pd.DataFrame.from_dict(feeder_dict[feeder_name])[in_feeder_whitelisted_columns]
         feeder_df = feeder_df.assign(timestamp=timestamp_column)
         feeder_df = feeder_df.assign(substation_name=substation_name.lower())
         feeder_df = feeder_df.assign(feeder_name=feeder_name.lower())
@@ -129,7 +137,7 @@ def write_lv_lines_csvs(lv_lines_df, substation_name, date, timestamp_column, vo
     low_voltage_lines_voltage_dict = {}
 
     for column in lv_lines_df:
-        column_regex = re.search('.*?(\d+)(LV\d+)(.*)', column.strip())
+        column_regex = re.search('.*?(\d+)(LV\d+)(.*)', column.strip().replace(' ', ''))
         if column_regex is None:
             continue
         voltage = column_regex.group(1)
@@ -141,7 +149,8 @@ def write_lv_lines_csvs(lv_lines_df, substation_name, date, timestamp_column, vo
         low_voltage_lines_voltage_dict[line_name] = voltage
 
     for line_name in low_voltage_lines_dict:
-        line_voltage = low_voltage_lines_voltage_dict[line_name]
+        line_voltage = low_voltage_lines_voltage_dict.get(line_name,
+                                                          low_voltage_lines_voltage_dict.get(line_name[:-2], 'NA'))
         line_df = pd.DataFrame.from_dict(low_voltage_lines_dict[line_name])
         line_df = line_df.assign(timestamp=timestamp_column)
         line_df = line_df.assign(substation_name=substation_name)
@@ -189,7 +198,7 @@ def write_transformer_lines_csvs(transformer_lines_df, substation_name, date, ti
     lines_voltage_dict = {}
 
     for column in transformer_lines_df:
-        column_regex = re.search('.*?(\d+)(.*?)(R?E?ACTIVE.*)', column.strip())
+        column_regex = re.search('.*?(\d+)(.*?)(R?E?ACTIVE.*)', column.strip().replace(' ', ''))
         if column_regex is None:
             continue
         voltage = column_regex.group(1)
@@ -201,9 +210,11 @@ def write_transformer_lines_csvs(transformer_lines_df, substation_name, date, ti
         lines_dict[line_name][column_type] = transformer_lines_df[column].values
         lines_voltage_dict[line_name] = voltage
 
+    handle_feeders_w_re_ending(lines_dict)
+
     for line_name in lines_dict:
-        line_voltage = lines_voltage_dict[line_name]
-        line_df = pd.DataFrame.from_dict(lines_dict[line_name])
+        line_voltage = lines_voltage_dict.get(line_name, lines_voltage_dict.get(line_name[:-2], 'NA'))
+        line_df = pd.DataFrame.from_dict(lines_dict[line_name])[transformer_line_whitelisted_columns]
         line_df = line_df.assign(timestamp=timestamp_column)
         line_df = line_df.assign(substation_name=substation_name)
         line_df = line_df.assign(line_name=line_name)
@@ -218,12 +229,15 @@ def write_csvs_for_block_3(excel_file, substation_name, date, voltage):
     block_df_part_2 = excel_file.parse(skiprows=6002, nrows=1442)
 
     # Clean up of the dataframe to remove dummy, blank and columns for 11 kv feeders
+    feeder_names_part_1 = get_feeder_name_series(block_df_part_1)
     block_df_part_1 = clean_block(block_df_part_1, [0, 1, 3, 4])
 
     # Clean up of the dataframe to remove dummy, blank and columns for 11 kv feeders
+    feeder_names_part_2 = get_feeder_name_series(block_df_part_2)
     block_df_part_2 = clean_block(block_df_part_2, [0, 1, 3, 4])
 
     block_df = pd.merge(block_df_part_1, block_df_part_2, on='timestamp', how='left')
+    feeder_name_series = pd.concat([feeder_names_part_1, feeder_names_part_2], sort=False)
     timestamp_column = block_df['timestamp'].values
 
     # Write nothing if there are less than two columns
@@ -233,15 +247,17 @@ def write_csvs_for_block_3(excel_file, substation_name, date, voltage):
 
     out_feeders_df = block_df.iloc[:, 1:]
 
-    write_out_feeders_csvs(out_feeders_df, substation_name, date, timestamp_column, voltage)
+    write_out_feeders_csvs(out_feeders_df, substation_name, date, timestamp_column, voltage, feeder_name_series)
 
 
-def write_out_feeders_csvs(out_feeders_df, substation_name, date, timestamp_column, substation_voltage):
+def write_out_feeders_csvs(out_feeders_df, substation_name, date, timestamp_column, substation_voltage,
+                           feeder_name_series):
     feeder_dict = {}
     feeder_voltage_dict = {}
+    feeder_names_dict = {}
 
     for column in out_feeders_df:
-        column_regex = re.search('.*?(\d+)(.*?)(I[A-Z]$|((RE)?ACTIVE.*)$)', column.strip())
+        column_regex = re.search('.*?(\d+)(.*?)(I[A-Z]$|((RE)?ACTIVE.*)$)', column.strip().replace(' ', ''))
         if column_regex is None:
             continue
         voltage = column_regex.group(1)
@@ -253,17 +269,56 @@ def write_out_feeders_csvs(out_feeders_df, substation_name, date, timestamp_colu
                                         'IB': np.nan, 'IR': np.nan, 'IY': np.nan}
         feeder_dict[feeder_name][column_type] = out_feeders_df[column].values
         feeder_voltage_dict[feeder_name] = voltage
+        if column_type == 'REACTIVEPOWER' or column_type == 'IY':
+            try:
+                feeder_names_dict[feeder_name] = feeder_name_series.get(column)
+            except Exception as e:
+                logging.error(f'FEEDER NAME missing for {substation_name}_{substation_voltage}_{date}_{feeder_name}'
+                              f'_{column_type}')
+
+    feeder_dict = handle_feeders_w_re_ending(feeder_dict)
+
 
     for feeder_name in feeder_dict:
-        feeder_voltage = feeder_voltage_dict[feeder_name]
-        feeder_df = pd.DataFrame.from_dict(feeder_dict[feeder_name])
+        feeder_voltage = feeder_voltage_dict.get(feeder_name, feeder_voltage_dict.get(feeder_name[:-2], 'NA'))
+        feeder_df = pd.DataFrame.from_dict(feeder_dict[feeder_name])[out_feeder_whitelisted_columns]
         feeder_df = feeder_df.assign(timestamp=timestamp_column)
         feeder_df = feeder_df.assign(substation_name=substation_name.lower())
         feeder_df = feeder_df.assign(feeder_name=feeder_name.lower())
+        feeder_df = feeder_df.assign(feeder_full_name=feeder_names_dict.get(feeder_name, 'NA'))
+        if feeder_name not in feeder_names_dict:
+            logging.error(f'FEEDER NAME PROBLEM FOR {substation_name}_{substation_voltage}_{date}_{feeder_name}')
         feeder_df.to_csv(os.path.join(csv_creation_path,
                                       f'substation_out_feeders/{substation_name}_{substation_voltage}_out_feeder_'
                                       f'{feeder_voltage}_kv_{feeder_name}_{date}.csv.gz'),
                          index=False, compression='gzip')
+
+
+def handle_feeders_w_re_ending(feeder_dict):
+    keys_to_delete = []
+    dict_to_add = {}
+    for feeder_name in feeder_dict:
+        current_feeder_dict = feeder_dict[feeder_name]
+        if 'REACTIVEENERGYEXP' in current_feeder_dict.keys() or 'REACTIVEENERGYIMP' in current_feeder_dict.keys():
+            correct_feeder_name = f'{feeder_name}RE'
+            if correct_feeder_name not in feeder_dict:
+                dict_to_add[correct_feeder_name] = {'ACTIVEPOWER': np.nan, 'REACTIVEPOWER': np.nan,
+                                                    'ACTIVEENERGYEXP': np.nan, 'ACTIVEENERGYIMP': np.nan,
+                                                    'IB': np.nan, 'IR': np.nan, 'IY': np.nan}
+                dict_to_add[correct_feeder_name]['ACTIVEPOWER'] = current_feeder_dict.get('REACTIVEPOWER', np.nan)
+                dict_to_add[correct_feeder_name]['ACTIVEENERGYEXP'] = current_feeder_dict.get('REACTIVEENERGYEXP',
+                                                                                              np.nan)
+                dict_to_add[correct_feeder_name]['ACTIVEENERGYIMP'] = current_feeder_dict.get('REACTIVEENERGYIMP',
+                                                                                              np.nan)
+            else:
+                feeder_dict[correct_feeder_name]['ACTIVEPOWER'] = current_feeder_dict.get('REACTIVEPOWER', np.nan)
+                feeder_dict[correct_feeder_name]['ACTIVEENERGYEXP'] = current_feeder_dict.get('REACTIVEENERGYEXP', np.nan)
+                feeder_dict[correct_feeder_name]['ACTIVEENERGYIMP'] = current_feeder_dict.get('REACTIVEENERGYIMP', np.nan)
+            keys_to_delete.append(feeder_name)
+    for key in keys_to_delete:
+        del feeder_dict[key]
+    feeder_dict.update(dict_to_add)
+    return feeder_dict
 
 
 def clean_block(block_df, columns_to_drop):
@@ -277,6 +332,9 @@ def clean_block(block_df, columns_to_drop):
     return block_df
 
 
+def get_feeder_name_series(block_df):
+    return block_df.iloc[1, :].fillna(method='ffill')
+
 if __name__ == '__main__':
     arguments = sys.argv
     rar_path = arguments[1]
@@ -289,7 +347,7 @@ if __name__ == '__main__':
         for file in s3.walk(rar_path):
             if file.endswith('.rar') and 'IPP' not in file and 'GEN' not in file and file_regex in file:
                 file_tags = s3.get_tags(file)
-                if 'status' in file_tags and file_tags['status'] == 'processed_v2':
+                if 'status' in file_tags and file_tags['status'] in ['processed_v2', 'processing_v2']:
                     logging.info(f'Skipping file {file} because it has status {file_tags["status"]}')
                     continue
                 try:
@@ -298,16 +356,20 @@ if __name__ == '__main__':
                     os.makedirs(os.path.join(csv_creation_path, 'substation_transformers'), exist_ok=True)
                     os.makedirs(os.path.join(csv_creation_path, 'transformer_lines'), exist_ok=True)
                     os.makedirs(os.path.join(csv_creation_path, 'substation_out_feeders'), exist_ok=True)
+                    os.makedirs(extraction_path, exist_ok=True)
 
 
-                    s3.put_tags(file, {'status': 'processing'})
+                    s3.put_tags(file, {'status': 'processing_v2'})
                     logging.info(f'Working on file {file}')
                     s3.get(file, temp_rar_location)
                     patoolib.extract_archive(temp_rar_location, outdir=extraction_path)
                     os.remove(temp_rar_location)
                     create_csvs(extraction_path)
-                    os.system(f'aws s3 cp --recursive {csv_creation_path} s3://brookings-india-bescom/converted_csvs')
-                    s3.put_tags(file, {'status': 'processed'})
+                    os.system(f'aws s3 cp --recursive {csv_creation_path} s3://brookings-india-bescom-data'
+                              f'/converted_csvs')
+                    os.system(f'aws s3 cp {log_path} s3://brookings-india-bescom-data/logs/{rar_path}_{file_regex}/'
+                              f'{start}/bescom_converter.log')
+                    s3.put_tags(file, {'status': 'processed_v2'})
                 except Exception as e:
                     logging.exception(f'Error while handling file {file}: {str(e)}')
                     s3.put_tags(file, {'status': 'failed'})
@@ -324,6 +386,6 @@ if __name__ == '__main__':
     finally:
         end = time.time()
         logging.info(f'Script took {(end - start)} seconds to run')
-        os.system(f'aws s3 cp {log_path} s3://brookings-india-bescom/logs/{rar_path}_{file_regex}/'
+        os.system(f'aws s3 cp {log_path} s3://brookings-india-bescom-data/logs/{rar_path}_{file_regex}/'
                   f'{start}/bescom_converter.log')
         os.system('sudo shutdown -h now')
